@@ -91,7 +91,7 @@ def test_split_locate_replace_assemble(env):
 
 def test_remove_regions_and_reset(env):
     ops, video, logo_path, _, tmp_path = env
-    result, _ = ops.split_video(str(video), str(logo_path), image_format="jpg", end_time=1.0)
+    result, _ = ops.split_video(str(video), str(logo_path), image_format="jpg", trim_end_time=1.0)
     pid = result["project_id"]
     assert result["frame_count"] == FPS
 

@@ -106,6 +106,41 @@ class Project:
             raise ProjectError(f"frame_index {i} out of range 0..{self.frame_count - 1}")
         return i
 
+    # ---- time -----------------------------------------------------------
+    # Times are on the source video's timeline, so they stay meaningful when the
+    # extraction was trimmed (frame 0 is then at extract.start, not at 0s).
+
+    def frame_time(self, i: int) -> float:
+        return self.manifest["extract"]["start"] + i / self.fps
+
+    def time_span(self) -> tuple[float, float]:
+        start = self.manifest["extract"]["start"]
+        return start, start + self.frame_count / self.fps
+
+    def frames_between(self, start: float | None, end: float | None) -> list[int]:
+        """Frames whose display interval overlaps [start, end]. None means open-ended."""
+        lo = -np.inf if start is None else start
+        hi = np.inf if end is None else end
+        if hi <= lo:
+            raise ProjectError(f"end time ({end}) must be after start time ({start})")
+        t = self.manifest["extract"]["start"] + np.arange(self.frame_count) / self.fps
+        eps = 1e-6
+        mask = (t + 1 / self.fps > lo + eps) & (t < hi - eps)
+        return np.flatnonzero(mask).tolist()
+
+    @property
+    def edit_window(self) -> dict | None:
+        return self.manifest.get("edit_window")
+
+    def edit_window_frames(self) -> list[int] | None:
+        """Frames editing tools may touch, or None when there is no window (all frames)."""
+        w = self.edit_window
+        return None if w is None else self.frames_between(w.get("start"), w.get("end"))
+
+    def in_edit_window(self, i: int) -> bool:
+        frames = self.edit_window_frames()
+        return frames is None or i in set(frames)
+
     # ---- frame IO -------------------------------------------------------
 
     def read_frame(self, i: int, edited: bool = True) -> np.ndarray:
@@ -234,6 +269,28 @@ def parse_indices(spec, count: int) -> list[int]:
                 result.add(int(part))
         spec = result
     return sorted(i for i in set(int(x) for x in spec) if 0 <= i < count)
+
+
+_TIME_RE = re.compile(r"^(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)s?$")
+
+
+def parse_time(value) -> float | None:
+    """Seconds from a number or a string like "90", "90s", "1:30", "00:01:30.5"."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        m = _TIME_RE.match(str(value).strip())
+        if not m:
+            raise ProjectError(f"invalid time {value!r}; use seconds (90, 90.5, '90s') or 'MM:SS' / 'HH:MM:SS'")
+        a, b, s = m.groups()
+        # One colon -> MM:SS, two -> HH:MM:SS.
+        hours, minutes = (int(a), int(b)) if b is not None else (0, int(a) if a else 0)
+        seconds = hours * 3600 + minutes * 60 + float(s)
+    if seconds < 0:
+        raise ProjectError("times must not be negative")
+    return seconds
 
 
 def load_image_bgra(path: str | Path) -> np.ndarray:

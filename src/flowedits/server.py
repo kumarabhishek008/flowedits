@@ -34,6 +34,14 @@ Video frame editing tools. Typical workflow for "replace / remove / change <this
 4. assemble_video(project_id) -> joins all frames (edited where available) into a video with the
    original audio.
 
+Time windows — when the user gives a time period ("only between 0:12 and 0:18", "first 5 seconds"):
+   pass edit_start_time / edit_end_time to split_video (or call set_edit_window later). This locks
+   the project: only frames in that window are searched and can be edited, every other frame stays
+   exactly as in the original video. The full video is still assembled. Do NOT use trim_start_time /
+   trim_end_time for this — those cut the output video itself.
+   Editing and viewing tools also accept start_time / end_time to narrow a single call further.
+   Times are seconds on the original video's timeline: 12, 12.5, "12s", "0:12", "00:00:12.5".
+
 Edits always start from the original frames by default, so re-running apply_to_target with other
 settings is safe; reset_frames reverts. Frame indices accept ints, lists or strings like "0-40,55".
 Workspace: {WORKSPACE}
@@ -45,6 +53,12 @@ FrameSelection = Annotated[
     list[int] | str | None,
     Field(description='Frames to act on: list of indices, a range string like "0-120,200-", or null for all.'),
 ]
+TimeValue = float | str | None
+StartTime = Annotated[
+    TimeValue,
+    Field(description='Only frames at or after this time (seconds on the source timeline: 12.5, "12.5s", "0:12.5").'),
+]
+EndTime = Annotated[TimeValue, Field(description="Only frames before this time (same formats as start_time).")]
 
 
 def _out(result: dict, image: bytes | None = None) -> list:
@@ -75,9 +89,26 @@ async def split_video(
         Field(description="Optional image (logo, poster, product...) to find in every frame. It is the thing to "
                           "replace/remove/modify. Should be a tight crop of how it appears in the video."),
     ] = None,
+    edit_start_time: Annotated[
+        TimeValue,
+        Field(description="Start of the time period to edit. Frames before it are never searched or modified. "
+                          'Seconds on the source timeline: 12.5, "12.5s", "0:12.5".'),
+    ] = None,
+    edit_end_time: Annotated[
+        TimeValue,
+        Field(description="End of the time period to edit. Frames after it are never searched or modified."),
+    ] = None,
     fps: Annotated[float | None, Field(description="Frames per second to extract. Default: source fps.")] = None,
-    start_time: Annotated[float | None, Field(description="Start time in seconds.")] = None,
-    end_time: Annotated[float | None, Field(description="End time in seconds.")] = None,
+    trim_start_time: Annotated[
+        TimeValue,
+        Field(description="Cut the video: drop everything before this time from the OUTPUT. Not for limiting edits "
+                          "(use edit_start_time)."),
+    ] = None,
+    trim_end_time: Annotated[
+        TimeValue,
+        Field(description="Cut the video: drop everything after this time from the OUTPUT. Not for limiting edits "
+                          "(use edit_end_time)."),
+    ] = None,
     max_frames: Annotated[int | None, Field(description="Stop after this many frames.")] = None,
     max_width: Annotated[int | None, Field(description="Downscale frames wider than this (keeps aspect).")] = None,
     image_format: Literal["png", "jpg"] = "png",
@@ -85,12 +116,25 @@ async def split_video(
     detection_method: Literal["auto", "template", "features"] = "auto",
 ) -> list:
     """Split a video into individual frames (new project) and, if target_image_path is given, locate that image in
-    every frame. Returns project_id, frame count, which frames contain the target and a preview of the first match."""
+    every frame. With edit_start_time/edit_end_time only that time period is searched and editable; the rest of the
+    video is kept untouched. Returns project_id, frame count, which frames contain the target and a preview."""
     result, preview = await _run(
-        ops.split_video, video_path, target_image_path, fps, start_time, end_time, max_frames, max_width,
-        image_format, match_threshold, detection_method,
+        ops.split_video, video_path, target_image_path, fps, trim_start_time, trim_end_time, max_frames, max_width,
+        image_format, match_threshold, detection_method, edit_start_time, edit_end_time,
     )
     return _out(result, preview)
+
+
+@mcp.tool()
+async def set_edit_window(
+    project_id: str,
+    start_time: Annotated[TimeValue, Field(description='Window start (12.5, "12.5s", "0:12.5"). null = from 0.')] = None,
+    end_time: Annotated[TimeValue, Field(description="Window end. null = to the end of the video.")] = None,
+) -> str:
+    """Restrict all edits to a time period (or clear the restriction by passing both as null). Frames outside the
+    window are never modified by apply_to_target, region import or update_frame. If a target was already located,
+    call locate_target again when the warning says new frames were not searched."""
+    return json.dumps(await _run(ops.set_edit_window, project_id, start_time, end_time), indent=1)
 
 
 @mcp.tool()
@@ -106,8 +150,9 @@ async def locate_target(
     max_gap: Annotated[int, Field(ge=0, description="Fill up to this many missed frames between detections.")] = 3,
     smooth_window: Annotated[int, Field(ge=1, description="Average corners over N frames to remove jitter.")] = 3,
 ) -> list:
-    """(Re)locate a target image in every frame of a project. Use to change the target, or retry with a different
-    threshold/method when split_video found too few or too many matches. Replaces previous detections."""
+    """(Re)locate a target image in every frame of a project (only inside the edit window, if one is set). Use to
+    change the target, or retry with a different threshold/method when split_video found too few or too many
+    matches. Replaces previous detections."""
     result, preview = await _run(ops.locate_target, project_id, target_image_path, match_threshold, method,
                                  max_gap, smooth_window)
     return _out(result, preview)
@@ -145,12 +190,15 @@ async def apply_to_target(
         Literal["original", "current"],
         Field(description="original = start from untouched frames (idempotent); current = stack on earlier edits."),
     ] = "original",
+    start_time: StartTime = None,
+    end_time: EndTime = None,
 ) -> list:
     """Apply one edit to the located target in every (selected) frame where it was found, following its position,
-    scale and perspective. This is the bulk operation: generate one replacement image, call this once."""
+    scale and perspective. This is the bulk operation: generate one replacement image, call this once.
+    Only frames inside the project's edit window (and start_time/end_time, if given) are changed."""
     result, preview = await _run(
         ops.apply_to_target, project_id, operation, replacement_path, frame_indices, fit, feather, padding,
-        opacity, strength, fill_color, frames_per_image, base,
+        opacity, strength, fill_color, frames_per_image, base, start_time, end_time,
     )
     return _out(result, preview)
 
@@ -160,10 +208,15 @@ async def export_target_regions(
     project_id: str,
     frame_indices: FrameSelection = None,
     base: Literal["original", "current"] = "original",
+    start_time: StartTime = None,
+    end_time: EndTime = None,
 ) -> str:
     """Save the target area of each frame as an upright, same-sized crop (regions/region_<index>.png) so you can edit
-    them individually (e.g. different content per frame). Follow with import_target_regions."""
-    return json.dumps(await _run(ops.export_target_regions, project_id, frame_indices, base), indent=1)
+    them individually (e.g. different content per frame). Follow with import_target_regions.
+    Only frames inside the edit window (and start_time/end_time, if given) are exported."""
+    return json.dumps(
+        await _run(ops.export_target_regions, project_id, frame_indices, base, start_time, end_time), indent=1
+    )
 
 
 @mcp.tool()
@@ -183,14 +236,19 @@ async def update_frame(
     image_path: Annotated[str, Field(description="Edited full frame. Resized to the frame size if needed; transparent "
                                                  "pixels keep the current frame.")],
 ) -> str:
-    """Replace one whole frame with an image you edited."""
+    """Replace one whole frame with an image you edited. Refused for frames outside the edit window."""
     return json.dumps(await _run(ops.update_frame, project_id, frame_index, image_path), indent=1)
 
 
 @mcp.tool()
-async def reset_frames(project_id: str, frame_indices: FrameSelection = None) -> str:
-    """Discard edits so frames revert to the originals (all frames when frame_indices is null)."""
-    return json.dumps(await _run(ops.reset_frames, project_id, frame_indices), indent=1)
+async def reset_frames(
+    project_id: str,
+    frame_indices: FrameSelection = None,
+    start_time: StartTime = None,
+    end_time: EndTime = None,
+) -> str:
+    """Discard edits so frames revert to the originals (all frames when no selection is given)."""
+    return json.dumps(await _run(ops.reset_frames, project_id, frame_indices, start_time, end_time), indent=1)
 
 
 @mcp.tool()
@@ -216,10 +274,12 @@ async def contact_sheet(
     edited: bool = True,
     annotate: bool = False,
     columns: Annotated[int, Field(ge=1, le=8)] = 4,
+    start_time: StartTime = None,
+    end_time: EndTime = None,
 ) -> list:
     """Grid of evenly spaced frames in one image — the cheapest way to check tracking or edits across the video."""
     result, image = await _run(ops.contact_sheet, project_id, count, frame_indices, only_with_target, only_edited,
-                               edited, annotate, columns)
+                               edited, annotate, columns, start_time, end_time)
     return _out(result, image)
 
 
@@ -229,9 +289,14 @@ async def list_frames(
     frame_indices: FrameSelection = None,
     only_with_target: bool = False,
     limit: Annotated[int, Field(ge=1, le=1000)] = 100,
+    start_time: StartTime = None,
+    end_time: EndTime = None,
 ) -> str:
-    """List frame file paths, timestamps, edit state and target position (quad/bbox)."""
-    return json.dumps(await _run(ops.list_frames, project_id, frame_indices, only_with_target, limit), indent=1)
+    """List frame file paths, timestamps, edit state, edit-window membership and target position (quad/bbox)."""
+    return json.dumps(
+        await _run(ops.list_frames, project_id, frame_indices, only_with_target, limit, start_time, end_time),
+        indent=1,
+    )
 
 
 @mcp.tool()
@@ -270,10 +335,18 @@ async def delete_video_project(project_id: str) -> str:
 
 
 @mcp.prompt()
-def edit_image_in_video(video_path: str, target_image_path: str, instruction: str) -> str:
-    """Guide the agent through replacing/removing/changing an image that appears throughout a video."""
+def edit_image_in_video(
+    video_path: str, target_image_path: str, instruction: str, start_time: str = "", end_time: str = ""
+) -> str:
+    """Guide the agent through replacing/removing/changing an image that appears in a video, optionally only
+    during a time period."""
+    window = ""
+    if start_time or end_time:
+        window = (f"\nOnly change the video between {start_time or 'the start'} and {end_time or 'the end'}; every "
+                  f"other frame must stay untouched. Pass edit_start_time={start_time or 'null'} and "
+                  f"edit_end_time={end_time or 'null'} to split_video.")
     return f"""Edit the video at {video_path}.
-The image at {target_image_path} appears in the video. Instruction: {instruction}
+The image at {target_image_path} appears in the video. Instruction: {instruction}{window}
 
 Steps:
 1. Call split_video with video_path and target_image_path. Check the preview: is the outline on the right thing?

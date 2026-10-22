@@ -29,18 +29,43 @@ edited version of each frame when there is one and the original otherwise.
 | Tool | Purpose |
 |---|---|
 | `probe_video` | Metadata: size, fps, frame count, duration, audio |
-| `split_video` | Extract frames into a new project. If `target_image_path` is given, it also locates the target and returns a preview with the target outlined |
+| `split_video` | Extract frames into a new project. If `target_image_path` is given, it also locates the target and returns a preview with the target outlined. `edit_start_time` / `edit_end_time` limit editing to a time period |
+| `set_edit_window` | Set, change or clear the time period that edits are limited to |
 | `locate_target` | Find the target again with another image, threshold or method (`auto` / `template` / `features`) |
 | `apply_to_target` | Bulk edit on every frame that contains the target: `replace` (an image file, or a folder of images shown in sequence), `remove` (inpaint), `blur`, `pixelate`, `fill`, `highlight` |
 | `export_target_regions` / `import_target_regions` | Save the target area of each frame as an upright crop, let the agent edit any of the crops, then paste them back with the original perspective |
 | `update_frame` | Replace one whole frame with an edited image |
-| `reset_frames` | Revert edits |
+| `reset_frames` | Revert edits (all, by frame, or by time range) |
 | `view_frame`, `contact_sheet`, `list_frames` | Check frames and edits (images are returned to the model) |
 | `assemble_video` | Join the frames into `.mp4` / `.mov` / `.webm` / `.gif`, keeping the source audio |
 | `project_status`, `list_video_projects`, `delete_video_project` | Manage projects |
 
-There is also an MCP prompt, `edit_image_in_video(video_path, target_image_path, instruction)`,
-that walks the agent through the workflow.
+There is also an MCP prompt, `edit_image_in_video(video_path, target_image_path, instruction,
+start_time, end_time)`, that walks the agent through the workflow.
+
+### Editing only part of the video
+
+Pass a time period to `split_video` and only that part of the video can change:
+
+```
+split_video("/videos/ad.mp4", target_image_path="/videos/old_logo.png",
+            edit_start_time="0:12", edit_end_time="0:18.5")
+```
+
+- The target is only searched for between 12 s and 18.5 s.
+- `apply_to_target`, `import_target_regions` and `update_frame` never modify frames outside that
+  period. `update_frame` refuses them with an error.
+- `assemble_video` still outputs the **whole** video. Frames outside the period are the original
+  frames, unchanged.
+- `set_edit_window` changes or clears the period later. If the new period includes frames that
+  haven't been searched, it says to run `locate_target` again.
+- `apply_to_target`, `export_target_regions`, `reset_frames`, `contact_sheet` and `list_frames` also
+  take `start_time` / `end_time` to narrow a single call further. They can never go outside the edit
+  window.
+
+Times are on the original video's timeline and can be written as `12`, `12.5`, `"12.5s"`, `"0:12.5"`
+or `"00:00:12.5"`. `trim_start_time` / `trim_end_time` are different: they cut the output video
+itself.
 
 ### Typical agent session
 
@@ -69,7 +94,7 @@ uv sync
   "mcpServers": {
     "flowedits": {
       "command": "uv",
-      "args": ["--directory", "/Users/abhishek/stiddle/flowedits", "run", "flowedits"],
+      "args": ["--directory", "/Users/abhishek/flowedits", "run", "flowedits"],
       "env": { "FLOWEDITS_WORKSPACE": "/Users/abhishek/flowedits-projects" }
     }
   }
@@ -79,7 +104,7 @@ uv sync
 Or with the Claude Code CLI:
 
 ```bash
-claude mcp add flowedits -- uv --directory /Users/abhishek/stiddle/flowedits run flowedits
+claude mcp add flowedits -- uv --directory /Users/abhishek/flowedits run flowedits
 ```
 
 ## Configuration

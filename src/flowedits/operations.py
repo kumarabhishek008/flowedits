@@ -19,9 +19,47 @@ from .workspace import (
     load_image_bgra,
     load_project,
     parse_indices,
+    parse_time,
 )
 
 OPERATIONS = ("replace", "remove", "blur", "pixelate", "fill", "highlight")
+
+
+def _select(project: Project, frame_indices=None, start_time=None, end_time=None, *, editing: bool) -> list[int]:
+    """Frames picked by indices AND time range; editing tools are further limited to the edit window."""
+    idx = parse_indices(frame_indices, project.frame_count)
+    start, end = parse_time(start_time), parse_time(end_time)
+    if start is not None or end is not None:
+        span = set(project.frames_between(start, end))
+        idx = [i for i in idx if i in span]
+    if editing:
+        window = project.edit_window_frames()
+        if window is not None:
+            allowed = set(window)
+            idx = [i for i in idx if i in allowed]
+    return idx
+
+
+def _window_info(project: Project) -> dict | None:
+    w = project.edit_window
+    if w is None:
+        return None
+    frames = project.edit_window_frames()
+    return {
+        "start_time": w.get("start"),
+        "end_time": w.get("end"),
+        "frames": _ranges(frames),
+        "frame_count": len(frames),
+        "rule": "Only these frames can be edited; every editing tool skips frames outside this time window.",
+    }
+
+
+def _no_frames_error(project: Project, what: str) -> ProjectError:
+    msg = f"no selected frames {what}"
+    if project.edit_window:
+        w = project.edit_window
+        msg += f" inside the edit window ({w.get('start')}s - {w.get('end')}s)"
+    return ProjectError(msg)
 
 
 def _ranges(indices: list[int]) -> str:
@@ -56,24 +94,27 @@ def split_video(
     video_path: str,
     target_image_path: str | None = None,
     fps: float | None = None,
-    start_time: float | None = None,
-    end_time: float | None = None,
+    trim_start_time=None,
+    trim_end_time=None,
     max_frames: int | None = None,
     max_width: int | None = None,
     image_format: str = "png",
     match_threshold: float = 0.7,
     detection_method: str = "auto",
+    edit_start_time=None,
+    edit_end_time=None,
 ) -> tuple[dict, bytes | None]:
     if image_format not in ("png", "jpg"):
         raise ProjectError("image_format must be png or jpg")
     info = media.probe(video_path)
     rate = float(fps or info["fps"] or 25.0)
-    start = float(start_time or 0.0)
+    start = parse_time(trim_start_time) or 0.0
+    trim_end = parse_time(trim_end_time)
     duration = None
-    if end_time is not None:
-        if end_time <= start:
-            raise ProjectError("end_time must be greater than start_time")
-        duration = end_time - start
+    if trim_end is not None:
+        if trim_end <= start:
+            raise ProjectError("trim_end_time must be greater than trim_start_time")
+        duration = trim_end - start
 
     project = create_project(info, Path(video_path).stem)
     try:
@@ -82,7 +123,7 @@ def split_video(
             start=start or None, duration=duration, max_frames=max_frames, max_width=max_width,
         )
         if count == 0:
-            raise ProjectError("no frames extracted; check start_time/end_time")
+            raise ProjectError("no frames extracted; check trim_start_time/trim_end_time")
         first = cv2.imread(str(project.frames_dir / f"frame_000000.{image_format}"))
         project.manifest["extract"] = {
             "fps": rate, "start": start, "duration": round(count / rate, 3), "format": image_format,
@@ -90,6 +131,8 @@ def split_video(
         }
         project.manifest["frame_count"] = count
         project.log("split", frames=count, fps=rate)
+        if edit_start_time is not None or edit_end_time is not None:
+            _set_window(project, edit_start_time, edit_end_time)
         project.save()
     except Exception:
         shutil.rmtree(project.root, ignore_errors=True)
@@ -99,10 +142,13 @@ def split_video(
         "project_id": project.id,
         "frame_count": count,
         "fps": rate,
+        "time_span": [round(t, 3) for t in project.time_span()],
         "frame_size": [project.manifest["extract"]["width"], project.manifest["extract"]["height"]],
         "frames_dir": str(project.frames_dir),
         "source": info,
     }
+    if project.edit_window:
+        result["edit_window"] = _window_info(project)
     preview = None
     if target_image_path:
         located, preview = locate_target(
@@ -133,9 +179,14 @@ def locate_target(
     target_copy = project.root / "target.png"
     cv2.imwrite(str(target_copy), target)
 
+    # Only search where edits are allowed: faster, and nothing outside the window is ever marked editable.
+    searched = project.edit_window_frames()
+    if searched is None:
+        searched = list(range(project.frame_count))
     detector = TargetDetector(target, method=method, threshold=match_threshold)
-    raw = detect_in_frames(detector, lambda i: project.read_frame(i, edited=False), list(range(project.frame_count)))
-    detections = postprocess([raw[i] for i in range(project.frame_count)], max_gap=max_gap, smooth_window=smooth_window)
+    raw = detect_in_frames(detector, lambda i: project.read_frame(i, edited=False), searched)
+    detections = postprocess([raw.get(i) for i in range(project.frame_count)], max_gap=max_gap,
+                             smooth_window=smooth_window)
 
     project.manifest["target"] = {
         "source_path": str(Path(target_image_path).expanduser()),
@@ -143,11 +194,50 @@ def locate_target(
         "size": [int(target.shape[1]), int(target.shape[0])],
         "threshold": match_threshold,
         "method": method,
+        "searched_frames": _ranges(searched),
         "detections": detections,
     }
     project.log("locate_target", threshold=match_threshold, method=method)
     project.save()
     return target_summary(project), _first_match_preview(project)
+
+
+def _set_window(project: Project, start_time, end_time) -> None:
+    start, end = parse_time(start_time), parse_time(end_time)
+    if start is None and end is None:
+        project.manifest.pop("edit_window", None)
+        return
+    lo, hi = project.time_span()
+    frames = project.frames_between(start, end)
+    if not frames:
+        raise ProjectError(f"edit window {start}s - {end}s contains no frames; the extracted video spans "
+                           f"{lo:.3f}s - {hi:.3f}s")
+    project.manifest["edit_window"] = {"start": start, "end": end}
+
+
+def set_edit_window(project_id: str, start_time=None, end_time=None) -> dict:
+    project = load_project(project_id)
+    _set_window(project, start_time, end_time)
+    project.log("set_edit_window", start=parse_time(start_time), end=parse_time(end_time))
+    project.save()
+
+    result: dict = {"edit_window": _window_info(project) or "cleared: all frames can be edited"}
+    target = project.manifest.get("target")
+    if target:
+        window = project.edit_window_frames() or list(range(project.frame_count))
+        searched = set(parse_indices(target.get("searched_frames") or "all", project.frame_count))
+        missing = [i for i in window if i not in searched]
+        if missing:
+            result["warning"] = (
+                f"The target was not searched in frames {_ranges(missing)} of this window. Call locate_target "
+                "again so those frames can be edited too."
+            )
+    outside = [i for i in project.edited_indices() if not project.in_edit_window(i)]
+    if outside:
+        result["edited_frames_outside_window"] = _ranges(outside)
+        result["note"] = ("These frames were edited earlier and are outside the new window; they stay edited. "
+                          "Use reset_frames to revert them.")
+    return result
 
 
 def target_summary(project: Project) -> dict:
@@ -163,7 +253,10 @@ def target_summary(project: Project) -> dict:
         "mean_score": round(float(np.mean([dets[i]["score"] for i in found])), 3) if found else None,
         "best_score_in_unmatched_frames": missing_best,
         "threshold": project.manifest["target"]["threshold"],
+        "searched_frames": project.manifest["target"].get("searched_frames"),
     }
+    if project.edit_window:
+        summary["edit_window"] = _window_info(project)
     if found:
         summary["example_detection"] = {"frame_index": found[0], **dets[found[0]]}
         summary["next_steps"] = (
@@ -219,6 +312,8 @@ def apply_to_target(
     fill_color: str = "#000000",
     frames_per_image: int | None = None,
     base: str = "original",
+    start_time=None,
+    end_time=None,
 ) -> tuple[dict, bytes | None]:
     project = load_project(project_id)
     if operation not in OPERATIONS:
@@ -228,9 +323,9 @@ def apply_to_target(
     if base not in ("original", "current"):
         raise ProjectError("base must be 'original' or 'current'")
 
-    frames = [i for i in parse_indices(frame_indices, project.frame_count) if project.detection(i)]
+    frames = [i for i in _select(project, frame_indices, start_time, end_time, editing=True) if project.detection(i)]
     if not frames:
-        raise ProjectError("none of the selected frames contain the target")
+        raise _no_frames_error(project, "contain the target")
 
     images: list[np.ndarray] = []
     if operation == "replace":
@@ -264,6 +359,7 @@ def apply_to_target(
         "operation": operation,
         "frames_edited": len(frames),
         "frame_ranges": _ranges(frames),
+        "time_range": [round(project.frame_time(frames[0]), 3), round(project.frame_time(frames[-1]) + 1 / project.fps, 3)],
         "replacement_images": len(images) or None,
         "next_steps": "Check the preview / contact_sheet(only_edited=True). If it looks right call assemble_video.",
     }
@@ -281,11 +377,12 @@ def _parse_color(value: str) -> tuple[int, int, int]:
     return (b, g, r)
 
 
-def export_target_regions(project_id: str, frame_indices=None, base: str = "original") -> dict:
+def export_target_regions(project_id: str, frame_indices=None, base: str = "original", start_time=None,
+                          end_time=None) -> dict:
     project = load_project(project_id)
-    frames = [i for i in parse_indices(frame_indices, project.frame_count) if project.detection(i)]
+    frames = [i for i in _select(project, frame_indices, start_time, end_time, editing=True) if project.detection(i)]
     if not frames:
-        raise ProjectError("no selected frames contain the target")
+        raise _no_frames_error(project, "contain the target")
     out_dir = project.regions_dir
     if out_dir.exists():
         shutil.rmtree(out_dir)
@@ -326,9 +423,14 @@ def import_target_regions(project_id: str, feather: int = 2) -> tuple[dict, byte
     meta = project.manifest.get("regions")
     if not meta:
         raise ProjectError("no regions exported; call export_target_regions first")
-    applied, skipped = [], 0
+    applied, skipped, outside = [], 0, []
+    window = project.edit_window_frames()
+    allowed = None if window is None else set(window)
     for key, digest in meta["hashes"].items():
         i = int(key)
+        if allowed is not None and i not in allowed:
+            outside.append(i)  # the window changed after export
+            continue
         path = project.regions_dir / f"region_{i:06d}.png"
         if not path.exists() or hashlib.md5(path.read_bytes()).hexdigest() == digest:
             skipped += 1
@@ -340,12 +442,21 @@ def import_target_regions(project_id: str, feather: int = 2) -> tuple[dict, byte
     project.log("import_target_regions", frames=len(applied))
     project.save()
     preview = _encode(project.read_frame(applied[len(applied) // 2])) if applied else None
-    return {"frames_updated": len(applied), "frame_ranges": _ranges(applied), "unchanged_skipped": skipped}, preview
+    result = {"frames_updated": len(applied), "frame_ranges": _ranges(applied), "unchanged_skipped": skipped}
+    if outside:
+        result["outside_edit_window_skipped"] = _ranges(sorted(outside))
+    return result, preview
 
 
 def update_frame(project_id: str, frame_index: int, image_path: str) -> dict:
     project = load_project(project_id)
     i = project.check_index(frame_index)
+    if not project.in_edit_window(i):
+        w = project.edit_window
+        raise ProjectError(
+            f"frame {i} ({project.frame_time(i):.3f}s) is outside the edit window "
+            f"({w.get('start')}s - {w.get('end')}s); only frames {_ranges(project.edit_window_frames())} can be edited"
+        )
     img = load_image_bgra(image_path)
     h, w = project.manifest["extract"]["height"], project.manifest["extract"]["width"]
     resized = img.shape[:2] != (h, w)
@@ -359,9 +470,11 @@ def update_frame(project_id: str, frame_index: int, image_path: str) -> dict:
     return {"frame_index": i, "saved_to": str(path), "resized_to_frame_size": resized}
 
 
-def reset_frames(project_id: str, frame_indices=None) -> dict:
+def reset_frames(project_id: str, frame_indices=None, start_time=None, end_time=None) -> dict:
     project = load_project(project_id)
-    indices = None if frame_indices is None else parse_indices(frame_indices, project.frame_count)
+    # Reverting is always safe, so it is not limited to the edit window.
+    selective = frame_indices is not None or start_time is not None or end_time is not None
+    indices = _select(project, frame_indices, start_time, end_time, editing=False) if selective else None
     removed = project.reset(indices)
     project.log("reset_frames", frames=removed)
     project.save()
@@ -375,11 +488,13 @@ def frame_info(project: Project, i: int) -> dict:
     det = project.detection(i)
     info = {
         "frame_index": i,
-        "time": round(project.manifest["extract"]["start"] + i / project.fps, 3),
+        "time": round(project.frame_time(i), 3),
         "path": str(project.current_path(i)),
         "edited": project.is_edited(i),
         "has_target": det is not None,
     }
+    if project.edit_window:
+        info["in_edit_window"] = project.in_edit_window(i)
     if det:
         info.update(quad=det["quad"], bbox=det["bbox"], score=det["score"], method=det.get("method"))
     return info
@@ -393,6 +508,8 @@ def project_status(project_id: str) -> dict:
         "source": m["source"],
         "extract": m.get("extract"),
         "frame_count": project.frame_count,
+        "time_span": [round(t, 3) for t in project.time_span()],
+        "edit_window": _window_info(project),
         "edited_frames": _ranges(project.edited_indices()),
         "edited_count": len(project.edited_indices()),
         "outputs": [str(p) for p in sorted(project.output_dir.glob("*"))] if project.output_dir.exists() else [],
@@ -403,9 +520,10 @@ def project_status(project_id: str) -> dict:
     return status
 
 
-def list_frames(project_id: str, frame_indices=None, only_with_target: bool = False, limit: int = 100) -> dict:
+def list_frames(project_id: str, frame_indices=None, only_with_target: bool = False, limit: int = 100,
+                start_time=None, end_time=None) -> dict:
     project = load_project(project_id)
-    idx = parse_indices(frame_indices, project.frame_count)
+    idx = _select(project, frame_indices, start_time, end_time, editing=False)
     if only_with_target:
         idx = [i for i in idx if project.detection(i)]
     total = len(idx)
@@ -425,9 +543,9 @@ def view_frame(project_id: str, frame_index: int, edited: bool = True, annotate:
 
 def contact_sheet(project_id: str, count: int = 12, frame_indices=None, only_with_target: bool = False,
                   only_edited: bool = False, edited: bool = True, annotate: bool = False,
-                  columns: int = 4) -> tuple[dict, bytes]:
+                  columns: int = 4, start_time=None, end_time=None) -> tuple[dict, bytes]:
     project = load_project(project_id)
-    idx = parse_indices(frame_indices, project.frame_count)
+    idx = _select(project, frame_indices, start_time, end_time, editing=False)
     if only_with_target:
         idx = [i for i in idx if project.detection(i)]
     if only_edited:
