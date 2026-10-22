@@ -29,6 +29,7 @@ edited version of each frame when there is one and the original otherwise.
 | Tool | Purpose |
 |---|---|
 | `probe_video` | Metadata: size, fps, frame count, duration, audio |
+| `find_media` | Search Desktop, Downloads, Movies, Documents, Pictures and home for videos/images by name |
 | `split_video` | Extract frames into a new project. If `target_image_path` is given, it also locates the target and returns a preview with the target outlined. `edit_start_time` / `edit_end_time` limit editing to a time period |
 | `set_edit_window` | Set, change or clear the time period that edits are limited to |
 | `locate_target` | Find the target again with another image, threshold or method (`auto` / `template` / `features`) |
@@ -37,11 +38,29 @@ edited version of each frame when there is one and the original otherwise.
 | `update_frame` | Replace one whole frame with an edited image |
 | `reset_frames` | Revert edits (all, by frame, or by time range) |
 | `view_frame`, `contact_sheet`, `list_frames` | Check frames and edits (images are returned to the model) |
-| `assemble_video` | Join the frames into `.mp4` / `.mov` / `.webm` / `.gif`, keeping the source audio |
+| `assemble_video` | Join the frames into a video with the source audio. By default the result is saved next to the original as `<name>_edited.<ext>`. `replace_original=true` overwrites the original and keeps a backup |
 | `project_status`, `list_video_projects`, `delete_video_project` | Manage projects |
 
 There is also an MCP prompt, `edit_image_in_video(video_path, target_image_path, instruction,
 start_time, end_time)`, that walks the agent through the workflow.
+
+### Pasting a video path
+
+Paste the path to a video (or image) in any form and the server finds the file:
+
+- `/Users/me/Movies/My Trip.mov`, `~/Movies/My Trip.mov` or `"…/My Trip.mov"` (quoted)
+- `/Users/me/Movies/My\ Trip.mov` (escaped spaces, as when you drag a file into a terminal)
+- `file:///Users/me/Movies/My%20Trip.mov`
+- only the name, `My Trip.mov` or `my trip`: the server searches Desktop, Downloads, Movies, Documents,
+  Pictures, your home folder and any folders listed in `FLOWEDITS_SEARCH_DIRS`
+- macOS screen recordings work even though their file names contain an invisible special space
+  before "PM"
+
+If the name matches several files, the server lists them so you can pick one.
+
+The edited video is saved **next to the original** as `<name>_edited.<ext>`. Your original file is
+never overwritten unless you ask for it: `assemble_video(replace_original=true)` writes the edited
+version to the original's path and keeps the untouched file as `<name>.original.<ext>`.
 
 ### Editing only part of the video
 
@@ -111,7 +130,8 @@ claude mcp add flowedits -- uv --directory /Users/abhishek/flowedits run flowedi
 
 | Env var | Default | |
 |---|---|---|
-| `FLOWEDITS_WORKSPACE` | `~/.flowedits/projects` | Where frames, edits and outputs are stored |
+| `FLOWEDITS_WORKSPACE` | `~/.flowedits/projects` | Where frames and edits are stored |
+| `FLOWEDITS_SEARCH_DIRS` | (none) | Extra folders, separated by `:`, to search when only a file name is given |
 | `FFMPEG_BINARY` | ffmpeg on `PATH`, otherwise the bundled build | ffmpeg to use |
 
 ## Tips

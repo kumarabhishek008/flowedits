@@ -127,7 +127,7 @@ def assemble_video(
     output.parent.mkdir(parents=True, exist_ok=True)
     suffix = output.suffix.lower()
 
-    with tempfile.TemporaryDirectory(prefix="assemble-", dir=output.parent) as tmp:
+    with tempfile.TemporaryDirectory(prefix="flowedits-assemble-") as tmp:
         tmp_dir = Path(tmp)
         # ffmpeg's image2 demuxer needs one contiguous numbered sequence; mix edited and
         # original frames by symlinking them into place in order.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import cv2
 import numpy as np
 
 from . import edit, media
+from .paths import clean_path, resolve_media_path
 from .detect import TargetDetector, detect_in_frames, postprocess
 from .workspace import (
     Project,
@@ -106,7 +108,8 @@ def split_video(
 ) -> tuple[dict, bytes | None]:
     if image_format not in ("png", "jpg"):
         raise ProjectError("image_format must be png or jpg")
-    info = media.probe(video_path)
+    video = resolve_media_path(video_path, "video")
+    info = media.probe(video)
     rate = float(fps or info["fps"] or 25.0)
     start = parse_time(trim_start_time) or 0.0
     trim_end = parse_time(trim_end_time)
@@ -116,7 +119,7 @@ def split_video(
             raise ProjectError("trim_end_time must be greater than trim_start_time")
         duration = trim_end - start
 
-    project = create_project(info, Path(video_path).stem)
+    project = create_project(info, video.stem)
     try:
         count = media.extract_frames(
             info["path"], project.frames_dir, fps=rate, image_format=image_format,
@@ -175,7 +178,8 @@ def locate_target(
     smooth_window: int = 3,
 ) -> tuple[dict, bytes | None]:
     project = load_project(project_id)
-    target = load_image_bgra(target_image_path)
+    target_file = resolve_media_path(target_image_path, "image")
+    target = load_image_bgra(target_file)
     target_copy = project.root / "target.png"
     cv2.imwrite(str(target_copy), target)
 
@@ -189,7 +193,7 @@ def locate_target(
                              smooth_window=smooth_window)
 
     project.manifest["target"] = {
-        "source_path": str(Path(target_image_path).expanduser()),
+        "source_path": str(target_file),
         "path": str(target_copy),
         "size": [int(target.shape[1]), int(target.shape[0])],
         "threshold": match_threshold,
@@ -290,7 +294,7 @@ def _first_match_preview(project: Project) -> bytes | None:
 
 
 def _replacement_source(replacement_path: str) -> list[np.ndarray]:
-    p = Path(replacement_path).expanduser()
+    p = resolve_media_path(replacement_path, "image", allow_dir=True)
     if p.is_dir():
         files = list_images(p)
         if not files:
@@ -457,7 +461,7 @@ def update_frame(project_id: str, frame_index: int, image_path: str) -> dict:
             f"frame {i} ({project.frame_time(i):.3f}s) is outside the edit window "
             f"({w.get('start')}s - {w.get('end')}s); only frames {_ranges(project.edit_window_frames())} can be edited"
         )
-    img = load_image_bgra(image_path)
+    img = load_image_bgra(resolve_media_path(image_path, "image"))
     h, w = project.manifest["extract"]["height"], project.manifest["extract"]["width"]
     resized = img.shape[:2] != (h, w)
     if resized:
@@ -569,28 +573,75 @@ def contact_sheet(project_id: str, count: int = 12, frame_indices=None, only_wit
 # ---- assemble --------------------------------------------------------------
 
 
+KEEP_CONTAINERS = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
+
+
+def _user_video_path(project: Project) -> Path:
+    """Where the user's video lives (its original path, even after replace_original moved it to a backup)."""
+    src = project.manifest["source"]
+    return Path(src.get("user_path") or src["path"])
+
+
+def _default_output(project: Project) -> Path:
+    """<video folder>/<name>_edited.<ext>; never overwrites a file this project didn't write itself."""
+    src = _user_video_path(project)
+    ext = src.suffix.lower() if src.suffix.lower() in KEEP_CONTAINERS else ".mp4"
+    folder = src.parent if os.access(src.parent, os.W_OK) else project.output_dir
+    ours = set(project.manifest.get("outputs", []))
+    candidate, n = folder / f"{src.stem}_edited{ext}", 2
+    while candidate.exists() and str(candidate) not in ours:
+        candidate, n = folder / f"{src.stem}_edited_{n}{ext}", n + 1
+    return candidate
+
+
 def assemble(project_id: str, output_path: str | None = None, keep_audio: bool = True, fps: float | None = None,
-             crf: int = 18, use_edited: bool = True) -> dict:
+             crf: int = 18, use_edited: bool = True, replace_original: bool = False) -> dict:
     project = load_project(project_id)
+    if replace_original and output_path:
+        raise ProjectError("pass either output_path or replace_original, not both")
     rate = float(fps or project.fps)
     frames = [project.current_path(i) if use_edited else project.original_path(i) for i in range(project.frame_count)]
-    if output_path:
-        out = Path(output_path).expanduser().resolve()
+
+    user_video = _user_video_path(project)
+    if replace_original:
+        # Encode beside the original first; only swap once the new file is complete.
+        out = user_video.with_name(f"{user_video.stem}.flowedits-tmp{user_video.suffix}")
+    elif output_path:
+        out = Path(clean_path(output_path)).resolve()
     else:
-        stem = Path(project.manifest["source"]["path"]).stem
-        out = project.output_dir / f"{stem}_edited.mp4"
+        out = _default_output(project)
 
     src = project.manifest["source"]
     extract = project.manifest["extract"]
     with_audio = keep_audio and src.get("has_audio") and abs(rate - project.fps) < 1e-6
-    media.assemble_video(
-        frames, out, fps=rate,
-        audio_source=src["path"] if with_audio else None,
-        audio_start=extract["start"] or None,
-        audio_duration=project.frame_count / rate,
-        crf=crf,
-    )
-    project.log("assemble", output=str(out))
+    try:
+        media.assemble_video(
+            frames, out, fps=rate,
+            audio_source=src["path"] if with_audio else None,
+            audio_start=extract["start"] or None,
+            audio_duration=project.frame_count / rate,
+            crf=crf,
+        )
+    except Exception:
+        if replace_original:
+            out.unlink(missing_ok=True)
+        raise
+
+    backup = None
+    if replace_original:
+        backup = user_video.with_name(f"{user_video.stem}.original{user_video.suffix}")
+        if not backup.exists():
+            # First replacement: keep the untouched original. Later ones just overwrite the edited file.
+            os.replace(user_video, backup)
+        os.replace(out, user_video)
+        out = user_video
+        src["user_path"] = str(user_video)
+        src["path"] = str(backup)  # audio for future assembles comes from the untouched original
+
+    outputs = project.manifest.setdefault("outputs", [])
+    if str(out) not in outputs:
+        outputs.append(str(out))
+    project.log("assemble", output=str(out), replace_original=replace_original)
     project.save()
     info = media.probe(out)
     result = {
@@ -602,6 +653,8 @@ def assemble(project_id: str, output_path: str | None = None, keep_audio: bool =
         "size": [info["width"], info["height"]],
         "audio": bool(info["has_audio"]),
     }
+    if backup:
+        result["original_backup"] = str(backup)
     if keep_audio and src.get("has_audio") and not with_audio:
         result["note"] = "Audio dropped because fps differs from the extraction fps (it would be out of sync)."
     return result

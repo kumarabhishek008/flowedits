@@ -15,6 +15,8 @@ from mcp.server.mcpserver import Image, MCPServer
 from pydantic import Field
 
 from . import operations as ops
+from .paths import find_media as find_files
+from .paths import resolve_media_path
 from .workspace import WORKSPACE, delete_project, list_projects
 
 INSTRUCTIONS = f"""\
@@ -33,6 +35,14 @@ Video frame editing tools. Typical workflow for "replace / remove / change <this
 3. Verify with contact_sheet(only_edited=True) or view_frame.
 4. assemble_video(project_id) -> joins all frames (edited where available) into a video with the
    original audio.
+
+Paths — when the user pastes a video or image path, pass it exactly as given (quotes, escaped spaces,
+   file:// URLs, ~ and bare file names like "demo.mov" are all handled; the server searches Desktop,
+   Downloads, Movies, Documents, Pictures and home by name). If it reports several matches, ask the
+   user which one or use find_media. The edited video is saved next to the original as
+   <name>_edited.<ext> (the original is never overwritten) unless output_path is given; only pass
+   assemble_video(replace_original=true) when the user asks to change the original file itself —
+   it then keeps the untouched original as <name>.original.<ext>.
 
 Time windows — when the user gives a time period ("only between 0:12 and 0:18", "first 5 seconds"):
    pass edit_start_time / edit_end_time to split_video (or call set_edit_window later). This locks
@@ -73,21 +83,46 @@ async def _run(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+PastedPath = "Path as the user gave it: absolute, ~/..., quoted, file:// URL, or just a file name to search for."
+
+
 @mcp.tool()
-async def probe_video(video_path: Annotated[str, Field(description="Absolute path to a video file.")]) -> str:
+async def probe_video(video_path: Annotated[str, Field(description=f"The video. {PastedPath}")]) -> str:
     """Read video metadata (size, fps, frame count, duration, audio) without extracting anything."""
     from .media import probe
 
-    return json.dumps(await _run(probe, video_path), indent=1)
+    return json.dumps(await _run(lambda: probe(resolve_media_path(video_path, "video"))), indent=1)
+
+
+@mcp.tool()
+async def find_media(
+    query: Annotated[str, Field(description='File name or part of it, e.g. "demo.mov", "Screen Recording", "logo".')],
+    kind: Literal["video", "image", "any"] = "video",
+    limit: Annotated[int, Field(ge=1, le=50)] = 10,
+) -> str:
+    """Search Desktop, Downloads, Movies, Documents, Pictures and home for videos/images by name (newest first).
+    Use when a pasted path doesn't exist or matches several files."""
+
+    def search():
+        from datetime import datetime
+
+        out = []
+        for p in find_files(query, kind, limit):
+            st = p.stat()
+            out.append({"path": str(p), "size_mb": round(st.st_size / 1e6, 2),
+                        "modified": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")})
+        return {"query": query, "matches": out}
+
+    return json.dumps(await _run(search), indent=1)
 
 
 @mcp.tool()
 async def split_video(
-    video_path: Annotated[str, Field(description="Absolute path to the input video.")],
+    video_path: Annotated[str, Field(description=f"The input video. {PastedPath}")],
     target_image_path: Annotated[
         str | None,
         Field(description="Optional image (logo, poster, product...) to find in every frame. It is the thing to "
-                          "replace/remove/modify. Should be a tight crop of how it appears in the video."),
+                          f"replace/remove/modify. Should be a tight crop of how it appears in the video. {PastedPath}"),
     ] = None,
     edit_start_time: Annotated[
         TimeValue,
@@ -140,7 +175,7 @@ async def set_edit_window(
 @mcp.tool()
 async def locate_target(
     project_id: str,
-    target_image_path: Annotated[str, Field(description="Image to find in each frame.")],
+    target_image_path: Annotated[str, Field(description=f"Image to find in each frame. {PastedPath}")],
     match_threshold: Annotated[float, Field(ge=0.2, le=0.99)] = 0.7,
     method: Annotated[
         Literal["auto", "template", "features"],
@@ -169,7 +204,7 @@ async def apply_to_target(
     replacement_path: Annotated[
         str | None,
         Field(description="For replace: an image file (PNG transparency supported), or a folder of images to show "
-                          "in sequence across the frames."),
+                          f"in sequence across the frames. {PastedPath}"),
     ] = None,
     frame_indices: FrameSelection = None,
     fit: Annotated[
@@ -234,7 +269,7 @@ async def update_frame(
     project_id: str,
     frame_index: int,
     image_path: Annotated[str, Field(description="Edited full frame. Resized to the frame size if needed; transparent "
-                                                 "pixels keep the current frame.")],
+                                                 f"pixels keep the current frame. {PastedPath}")],
 ) -> str:
     """Replace one whole frame with an image you edited. Refused for frames outside the edit window."""
     return json.dumps(await _run(ops.update_frame, project_id, frame_index, image_path), indent=1)
@@ -304,15 +339,25 @@ async def assemble_video(
     project_id: str,
     output_path: Annotated[
         str | None,
-        Field(description="Where to write the video (.mp4, .mov, .webm or .gif). Default: project output folder."),
+        Field(description="Where to write the video (.mp4, .mov, .mkv, .webm or .gif). Default: next to the "
+                          "original video as <name>_edited.<ext>."),
     ] = None,
     keep_audio: bool = True,
     fps: Annotated[float | None, Field(description="Override frame rate (drops audio if it differs).")] = None,
     crf: Annotated[int, Field(ge=0, le=51, description="Quality: lower is better/larger.")] = 18,
     use_edited: Annotated[bool, Field(description="false = rebuild from original frames.")] = True,
+    replace_original: Annotated[
+        bool,
+        Field(description="Overwrite the user's original video file in place (only when they ask for that). The "
+                          "untouched original is kept as <name>.original.<ext>."),
+    ] = False,
 ) -> str:
-    """Join all frames (edited where available, original elsewhere) back into a video with the source audio."""
-    return json.dumps(await _run(ops.assemble, project_id, output_path, keep_audio, fps, crf, use_edited), indent=1)
+    """Join all frames (edited where available, original elsewhere) back into a video with the source audio.
+    By default the result is saved next to the original video as <name>_edited.<ext>."""
+    return json.dumps(
+        await _run(ops.assemble, project_id, output_path, keep_audio, fps, crf, use_edited, replace_original),
+        indent=1,
+    )
 
 
 @mcp.tool()
