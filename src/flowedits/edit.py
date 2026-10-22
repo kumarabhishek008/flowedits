@@ -36,6 +36,25 @@ def expand_quad(quad, pixels: float) -> np.ndarray:
     return (center + np.outer(u * scale[0], x_axis) + np.outer(v * scale[1], y_axis)).astype(np.float32)
 
 
+def on_region(frame: np.ndarray, quad, margin: int, fn) -> np.ndarray:
+    """Run fn(roi, shifted_quad) on just the area around the quad and paste the result back.
+
+    Targets are usually small next to the frame, so editing a cropped region instead of the whole
+    1080p/4K frame is many times faster. `margin` must cover everything fn touches outside the quad
+    (padding, feathering, blur radius, inpainting neighbourhood). Modifies `frame` in place.
+    """
+    q = _quad(quad)
+    x, y, w, h = cv2.boundingRect(q)
+    fh, fw = frame.shape[:2]
+    x0, y0 = max(0, x - margin), max(0, y - margin)
+    x1, y1 = min(fw, x + w + margin), min(fh, y + h + margin)
+    if x1 <= x0 or y1 <= y0:
+        return frame  # entirely outside the frame
+    roi = np.ascontiguousarray(frame[y0:y1, x0:x1])
+    frame[y0:y1, x0:x1] = fn(roi, q - np.float32([x0, y0]))
+    return frame
+
+
 def region_mask(shape: tuple[int, ...], quad, padding: int = 0) -> np.ndarray:
     mask = np.zeros(shape[:2], np.uint8)
     cv2.fillConvexPoly(mask, np.round(_quad(quad)).astype(np.int32), 255)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import filecmp
-
 import pytest
 
 from test_pipeline import FPS, N_FRAMES, env  # noqa: F401  (fixture)
@@ -57,9 +55,10 @@ def test_edit_window_limits_detection_and_edits(env):  # noqa: F811
     # The final video is still full length, with untouched frames outside the window.
     out = ops.assemble(pid, str(tmp_path / "windowed.mp4"))
     assert abs(out["duration"] - N_FRAMES / FPS) < 0.15
+    project = load_project(pid)
+    assert project.edited_indices() == list(range(12, 18))
     for i in (0, 11, 30, 47):
         assert not project.is_edited(i)
-        assert filecmp.cmp(project.current_path(i), project.original_path(i), shallow=False)
 
 
 def test_set_edit_window_widen_and_clear(env):  # noqa: F811

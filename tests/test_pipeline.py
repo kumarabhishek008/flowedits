@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 from pathlib import Path
 
 import cv2
@@ -29,10 +28,7 @@ def logo_pos(i: int) -> tuple[int, int]:
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOWEDITS_WORKSPACE", str(tmp_path / "ws"))
-    from flowedits import media, operations, workspace
-
-    importlib.reload(workspace)
-    importlib.reload(operations)
+    from flowedits import media, operations
 
     logo = make_logo()
     frames_dir = tmp_path / "src_frames"
@@ -91,7 +87,7 @@ def test_split_locate_replace_assemble(env):
 
 def test_remove_regions_and_reset(env):
     ops, video, logo_path, _, tmp_path = env
-    result, _ = ops.split_video(str(video), str(logo_path), image_format="jpg", trim_end_time=1.0)
+    result, _ = ops.split_video(str(video), str(logo_path), trim_end_time=1.0)
     pid = result["project_id"]
     assert result["frame_count"] == FPS
 
