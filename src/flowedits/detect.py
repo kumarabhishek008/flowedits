@@ -205,11 +205,13 @@ def detect_in_frames(
     detector: TargetDetector,
     read_frame: Callable[[int], np.ndarray],
     indices: list[int],
+    independent: bool = False,
 ) -> dict[int, dict]:
+    """Detect in each frame. `independent` (unrelated photos) disables carrying size hints between frames."""
     results: dict[int, dict] = {}
     prev = None
     for i in indices:
-        if prev is not None and i != prev + 1:
+        if independent or (prev is not None and i != prev + 1):
             detector._prev_width = None  # not consecutive; drop tracking state
         results[i] = detector.detect(read_frame(i))
         prev = i

@@ -23,6 +23,7 @@ from .workspace import (
     parse_indices,
     parse_time,
 )
+from .workspace import IMAGE_EXTS
 
 OPERATIONS = ("replace", "remove", "blur", "pixelate", "fill", "highlight")
 
@@ -31,6 +32,8 @@ def _select(project: Project, frame_indices=None, start_time=None, end_time=None
     """Frames picked by indices AND time range; editing tools are further limited to the edit window."""
     idx = parse_indices(frame_indices, project.frame_count)
     start, end = parse_time(start_time), parse_time(end_time)
+    if (start is not None or end is not None) and is_photos(project):
+        raise ProjectError("start_time/end_time apply to videos only; select photos with frame_indices")
     if start is not None or end is not None:
         span = set(project.frames_between(start, end))
         idx = [i for i in idx if i in span]
@@ -108,7 +111,11 @@ def split_video(
 ) -> tuple[dict, bytes | None]:
     if image_format not in ("png", "jpg"):
         raise ProjectError("image_format must be png or jpg")
-    video = resolve_media_path(video_path, "video")
+    video = resolve_media_path(video_path, "any", allow_dir=True)
+    if video.is_dir() or video.suffix.lower() in IMAGE_EXTS:
+        if any(v is not None for v in (trim_start_time, trim_end_time, edit_start_time, edit_end_time)):
+            raise ProjectError("time options apply to videos only; this is a photo (or folder of photos)")
+        return open_photos(str(video), target_image_path, match_threshold, detection_method)
     info = media.probe(video)
     rate = float(fps or info["fps"] or 25.0)
     start = parse_time(trim_start_time) or 0.0
@@ -166,6 +173,62 @@ def split_video(
     return result, preview
 
 
+def is_photos(project: Project) -> bool:
+    return project.manifest.get("media_type") == "photos"
+
+
+def open_photos(
+    photo_path: str,
+    target_image_path: str | None = None,
+    match_threshold: float = 0.7,
+    detection_method: str = "auto",
+) -> tuple[dict, bytes | None]:
+    """A photo, or a folder of photos, as a project: each photo is one frame. Same edit tools as videos."""
+    src = resolve_media_path(photo_path, "image", allow_dir=True)
+    paths = list_images(src) if src.is_dir() else [src]
+    if not paths:
+        raise ProjectError(f"no photos found in {src}")
+
+    project = create_project({"path": str(src), "kind": "photos", "photo_count": len(paths)}, src.stem)
+    try:
+        project.frames_dir.mkdir(parents=True, exist_ok=True)
+        photos = []
+        for n, path in enumerate(paths):
+            img = cv2.imread(str(path), cv2.IMREAD_COLOR)  # applies EXIF orientation
+            if img is None:
+                raise ProjectError(f"could not read photo {path}")
+            # Lossless working copy; the photo is re-encoded in its own format only when saved.
+            cv2.imwrite(str(project.frames_dir / f"frame_{n:06d}.png"), img)
+            photos.append({"path": str(path.resolve()), "width": int(img.shape[1]), "height": int(img.shape[0])})
+        project.manifest.update(
+            media_type="photos",
+            photos=photos,
+            frame_count=len(photos),
+            extract={"fps": 1.0, "start": 0.0, "duration": float(len(photos)), "format": "png",
+                     "width": photos[0]["width"], "height": photos[0]["height"]},
+        )
+        project.log("open_photos", photos=len(photos))
+        project.save()
+    except Exception:
+        shutil.rmtree(project.root, ignore_errors=True)
+        raise
+
+    result = {
+        "project_id": project.id,
+        "media_type": "photos",
+        "photo_count": len(photos),
+        "photos": [{"frame_index": n, **ph} for n, ph in enumerate(photos[:50])],
+        "note": "Each photo is one frame (frame_index). Edit them with the same tools as video frames, then call "
+                "save_photos.",
+    }
+    preview = None
+    if target_image_path:
+        located, preview = locate_target(project.id, target_image_path, match_threshold=match_threshold,
+                                         method=detection_method)
+        result["target"] = located
+    return result, preview
+
+
 # ---- detection -----------------------------------------------------------
 
 
@@ -188,9 +251,11 @@ def locate_target(
     if searched is None:
         searched = list(range(project.frame_count))
     detector = TargetDetector(target, method=method, threshold=match_threshold)
-    raw = detect_in_frames(detector, lambda i: project.read_frame(i, edited=False), searched)
-    detections = postprocess([raw.get(i) for i in range(project.frame_count)], max_gap=max_gap,
-                             smooth_window=smooth_window)
+    photos = is_photos(project)
+    raw = detect_in_frames(detector, lambda i: project.read_frame(i, edited=False), searched, independent=photos)
+    # Separate photos are unrelated: never interpolate or smooth positions between them.
+    detections = postprocess([raw.get(i) for i in range(project.frame_count)], max_gap=0 if photos else max_gap,
+                             smooth_window=1 if photos else smooth_window)
 
     project.manifest["target"] = {
         "source_path": str(target_file),
@@ -221,6 +286,8 @@ def _set_window(project: Project, start_time, end_time) -> None:
 
 def set_edit_window(project_id: str, start_time=None, end_time=None) -> dict:
     project = load_project(project_id)
+    if is_photos(project):
+        raise ProjectError("edit windows apply to videos only; select photos with frame_indices")
     _set_window(project, start_time, end_time)
     project.log("set_edit_window", start=parse_time(start_time), end=parse_time(end_time))
     project.save()
@@ -269,7 +336,7 @@ def target_summary(project: Project) -> dict:
             "you generated (it is warped onto the target's position/perspective in every frame), 'remove' to "
             "erase it, or 'blur'/'pixelate'/'fill'. Pass a folder as replacement_path to show different images "
             "over time. For frame-specific edits use export_target_regions -> edit the crops -> "
-            "import_target_regions. Then call assemble_video."
+            "import_target_regions. Then call assemble_video (videos) or save_photos (photos)."
         )
     else:
         summary["next_steps"] = (
@@ -462,7 +529,7 @@ def update_frame(project_id: str, frame_index: int, image_path: str) -> dict:
             f"({w.get('start')}s - {w.get('end')}s); only frames {_ranges(project.edit_window_frames())} can be edited"
         )
     img = load_image_bgra(resolve_media_path(image_path, "image"))
-    h, w = project.manifest["extract"]["height"], project.manifest["extract"]["width"]
+    h, w = project.read_frame(i, edited=False).shape[:2]
     resized = img.shape[:2] != (h, w)
     if resized:
         img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
@@ -492,7 +559,8 @@ def frame_info(project: Project, i: int) -> dict:
     det = project.detection(i)
     info = {
         "frame_index": i,
-        "time": round(project.frame_time(i), 3),
+        **({"photo": project.manifest["photos"][i]["path"]} if is_photos(project)
+           else {"time": round(project.frame_time(i), 3)}),
         "path": str(project.current_path(i)),
         "edited": project.is_edited(i),
         "has_target": det is not None,
@@ -582,11 +650,10 @@ def _user_video_path(project: Project) -> Path:
     return Path(src.get("user_path") or src["path"])
 
 
-def _default_output(project: Project) -> Path:
-    """<video folder>/<name>_edited.<ext>; never overwrites a file this project didn't write itself."""
-    src = _user_video_path(project)
-    ext = src.suffix.lower() if src.suffix.lower() in KEEP_CONTAINERS else ".mp4"
-    folder = src.parent if os.access(src.parent, os.W_OK) else project.output_dir
+def _edited_beside(project: Project, src: Path, ext: str, folder: Path | None = None) -> Path:
+    """<folder>/<name>_edited<ext>; never overwrites a file this project didn't write itself."""
+    if folder is None:
+        folder = src.parent if os.access(src.parent, os.W_OK) else project.output_dir
     ours = set(project.manifest.get("outputs", []))
     candidate, n = folder / f"{src.stem}_edited{ext}", 2
     while candidate.exists() and str(candidate) not in ours:
@@ -594,9 +661,78 @@ def _default_output(project: Project) -> Path:
     return candidate
 
 
+def _default_output(project: Project) -> Path:
+    src = _user_video_path(project)
+    return _edited_beside(project, src, src.suffix.lower() if src.suffix.lower() in KEEP_CONTAINERS else ".mp4")
+
+
+PHOTO_FORMATS = {".jpg": [cv2.IMWRITE_JPEG_QUALITY, 95], ".jpeg": [cv2.IMWRITE_JPEG_QUALITY, 95],
+                 ".webp": [cv2.IMWRITE_WEBP_QUALITY, 95], ".png": [], ".bmp": [], ".tif": [], ".tiff": []}
+
+
+def _write_image(img: np.ndarray, dest: Path) -> None:
+    """Write via a temp file in the same folder so a failure never leaves a half-written photo."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.stem}.flowedits-tmp{dest.suffix}")
+    if not cv2.imwrite(str(tmp), img, PHOTO_FORMATS.get(dest.suffix.lower(), [])):
+        tmp.unlink(missing_ok=True)
+        raise ProjectError(f"failed to write {dest}")
+    os.replace(tmp, dest)
+
+
+def save_photos(project_id: str, output_path: str | None = None, replace_original: bool = False,
+                frame_indices=None) -> dict:
+    project = load_project(project_id)
+    if not is_photos(project):
+        raise ProjectError("this project is a video; use assemble_video")
+    if replace_original and output_path:
+        raise ProjectError("pass either output_path or replace_original, not both")
+    photos = project.manifest["photos"]
+    edited = set(project.edited_indices())
+    targets = [i for i in parse_indices(frame_indices, project.frame_count) if i in edited]
+    if not targets:
+        raise ProjectError("no edited photos to save; edit them first (apply_to_target, update_frame, ...)")
+
+    out_file = out_dir = None
+    if output_path:
+        dest = Path(clean_path(output_path)).expanduser()
+        if len(targets) == 1 and dest.suffix.lower() in PHOTO_FORMATS:
+            out_file = dest.resolve()
+        else:
+            out_dir = dest.resolve()
+
+    saved, backups = [], []
+    for i in targets:
+        orig = Path(photos[i]["path"])
+        ext = orig.suffix.lower() if orig.suffix.lower() in PHOTO_FORMATS else ".png"
+        if replace_original:
+            backup = orig.with_name(f"{orig.stem}.original{orig.suffix}")
+            if not backup.exists():  # keep the first, untouched original
+                shutil.copy2(orig, backup)
+            backups.append(str(backup))
+            dest = orig
+        elif out_file:
+            dest = out_file
+        else:
+            dest = _edited_beside(project, orig, ext, out_dir)
+        _write_image(project.read_frame(i), dest)
+        saved.append({"frame_index": i, "original": str(orig), "saved_to": str(dest)})
+
+    outputs = project.manifest.setdefault("outputs", [])
+    outputs.extend(s["saved_to"] for s in saved if s["saved_to"] not in outputs)
+    project.log("save_photos", photos=len(saved), replace_original=replace_original)
+    project.save()
+    result = {"saved": saved, "unedited_photos_skipped": project.frame_count - len(edited)}
+    if backups:
+        result["original_backups"] = backups
+    return result
+
+
 def assemble(project_id: str, output_path: str | None = None, keep_audio: bool = True, fps: float | None = None,
              crf: int = 18, use_edited: bool = True, replace_original: bool = False) -> dict:
     project = load_project(project_id)
+    if is_photos(project):
+        return save_photos(project_id, output_path, replace_original)
     if replace_original and output_path:
         raise ProjectError("pass either output_path or replace_original, not both")
     rate = float(fps or project.fps)

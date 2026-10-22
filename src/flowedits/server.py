@@ -20,7 +20,7 @@ from .paths import resolve_media_path
 from .workspace import WORKSPACE, delete_project, list_projects
 
 INSTRUCTIONS = f"""\
-Video frame editing tools. Typical workflow for "replace / remove / change <this image> in the video":
+Video and photo editing tools. Typical workflow for "replace / remove / change <this image> in the video":
 
 1. split_video(video_path, target_image_path=<image to find>)
    -> extracts every frame and locates the target image in each one (position + perspective).
@@ -35,6 +35,12 @@ Video frame editing tools. Typical workflow for "replace / remove / change <this
 3. Verify with contact_sheet(only_edited=True) or view_frame.
 4. assemble_video(project_id) -> joins all frames (edited where available) into a video with the
    original audio.
+
+Photos — the same workflow works for a photo or a folder of photos: open_photos(photo_path,
+   target_image_path=...) (split_video also accepts photos), then the same locate_target /
+   apply_to_target / export+import regions / update_frame / view_frame tools, where each photo is one
+   frame (frame_index). Finish with save_photos(project_id): every edited photo is saved next to its
+   original as <name>_edited.<ext> in the same format. Time options do not apply to photos.
 
 Paths — when the user pastes a video or image path, pass it exactly as given (quotes, escaped spaces,
    file:// URLs, ~ and bare file names like "demo.mov" are all handled; the server searches Desktop,
@@ -151,13 +157,49 @@ async def split_video(
     detection_method: Literal["auto", "template", "features"] = "auto",
 ) -> list:
     """Split a video into individual frames (new project) and, if target_image_path is given, locate that image in
-    every frame. With edit_start_time/edit_end_time only that time period is searched and editable; the rest of the
+    every frame. A photo or folder of photos also works here (same as open_photos). With edit_start_time/edit_end_time only that time period is searched and editable; the rest of the
     video is kept untouched. Returns project_id, frame count, which frames contain the target and a preview."""
     result, preview = await _run(
         ops.split_video, video_path, target_image_path, fps, trim_start_time, trim_end_time, max_frames, max_width,
         image_format, match_threshold, detection_method, edit_start_time, edit_end_time,
     )
     return _out(result, preview)
+
+
+@mcp.tool()
+async def open_photos(
+    photo_path: Annotated[str, Field(description=f"A photo, or a folder of photos (each becomes one frame). {PastedPath}")],
+    target_image_path: Annotated[
+        str | None,
+        Field(description="Optional image (logo, sign, object...) to find in every photo — the thing to replace, "
+                          f"remove or modify. {PastedPath}"),
+    ] = None,
+    match_threshold: Annotated[float, Field(ge=0.2, le=0.99, description="Detection confidence needed (0-1).")] = 0.7,
+    detection_method: Literal["auto", "template", "features"] = "auto",
+) -> list:
+    """Open a photo (or folder of photos) for editing — the photo version of split_video. Each photo is one frame,
+    so locate_target / apply_to_target / regions / update_frame / view_frame work the same. Finish with save_photos."""
+    result, preview = await _run(ops.open_photos, photo_path, target_image_path, match_threshold, detection_method)
+    return _out(result, preview)
+
+
+@mcp.tool()
+async def save_photos(
+    project_id: str,
+    output_path: Annotated[
+        str | None,
+        Field(description="A file path (one photo) or a folder. Default: next to each original as "
+                          "<name>_edited.<ext>."),
+    ] = None,
+    replace_original: Annotated[
+        bool,
+        Field(description="Overwrite the original photos in place (only when the user asks for that). Each "
+                          "untouched original is kept as <name>.original.<ext>."),
+    ] = False,
+    frame_indices: FrameSelection = None,
+) -> str:
+    """Save the edited photos of a photo project (unedited photos are skipped), keeping each photo's format."""
+    return json.dumps(await _run(ops.save_photos, project_id, output_path, replace_original, frame_indices), indent=1)
 
 
 @mcp.tool()
@@ -353,7 +395,8 @@ async def assemble_video(
     ] = False,
 ) -> str:
     """Join all frames (edited where available, original elsewhere) back into a video with the source audio.
-    By default the result is saved next to the original video as <name>_edited.<ext>."""
+    By default the result is saved next to the original video as <name>_edited.<ext>. For a photo project this
+    saves the edited photos instead (same as save_photos)."""
     return json.dumps(
         await _run(ops.assemble, project_id, output_path, keep_audio, fps, crf, use_edited, replace_original),
         indent=1,

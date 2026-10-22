@@ -1,6 +1,6 @@
 # flowedits
 
-An MCP server for editing videos frame by frame. The AI agent handles the creative part: it
+An MCP server for editing videos frame by frame, and photos the same way. The AI agent handles the creative part: it
 looks at frames and makes one replacement image or edits a few crops. The server handles
 everything mechanical:
 
@@ -31,6 +31,7 @@ edited version of each frame when there is one and the original otherwise.
 | `probe_video` | Metadata: size, fps, frame count, duration, audio |
 | `find_media` | Search Desktop, Downloads, Movies, Documents, Pictures and home for videos/images by name |
 | `split_video` | Extract frames into a new project. If `target_image_path` is given, it also locates the target and returns a preview with the target outlined. `edit_start_time` / `edit_end_time` limit editing to a time period |
+| `open_photos` / `save_photos` | Open a photo or a folder of photos (each photo is one frame), then save the edited photos next to the originals |
 | `set_edit_window` | Set, change or clear the time period that edits are limited to |
 | `locate_target` | Find the target again with another image, threshold or method (`auto` / `template` / `features`) |
 | `apply_to_target` | Bulk edit on every frame that contains the target: `replace` (an image file, or a folder of images shown in sequence), `remove` (inpaint), `blur`, `pixelate`, `fill`, `highlight` |
@@ -43,6 +44,29 @@ edited version of each frame when there is one and the original otherwise.
 
 There is also an MCP prompt, `edit_image_in_video(video_path, target_image_path, instruction,
 start_time, end_time)`, that walks the agent through the workflow.
+
+### Photos
+
+Photos use the same workflow. Open one photo or a whole folder:
+
+```
+open_photos("~/Pictures/Shop Front.jpg", target_image_path="old_logo.png")
+apply_to_target(project_id, "replace", replacement_path="new_logo.png")
+save_photos(project_id)   # -> ~/Pictures/Shop Front_edited.jpg
+```
+
+- `split_video` also accepts a photo or a folder, and `assemble_video` on a photo project saves photos.
+- Each photo is one frame (`frame_index`), so `locate_target`, `apply_to_target`,
+  export/import regions, `update_frame`, `view_frame` and `contact_sheet` all work the same.
+- The target is found in each photo independently. A folder can mix sizes and only some photos need
+  to contain the target.
+- Edited photos are saved next to their originals as `<name>_edited.<ext>`, in the same format and at
+  full resolution. Unedited photos are skipped. `output_path` takes a file (one photo) or a folder.
+  `replace_original=true` overwrites the originals and keeps `<name>.original.<ext>` backups.
+- Time options (edit windows, `start_time` / `end_time`) are video-only. Select photos with
+  `frame_indices` instead.
+- Saved photos don't keep EXIF metadata. The rotation from EXIF is applied to the pixels, so the
+  photo still displays the right way up.
 
 ### Pasting a video path
 
