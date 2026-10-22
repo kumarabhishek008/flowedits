@@ -26,7 +26,7 @@ import cv2
 import numpy as np
 
 WORKSPACE = Path(
-    os.environ.get("VIDEO_FRAME_MCP_WORKSPACE", Path.home() / ".video-frame-mcp" / "projects")
+    os.environ.get("FLOWEDITS_WORKSPACE", Path.home() / ".flowedits" / "projects")
 ).expanduser()
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,63}$")

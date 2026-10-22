@@ -28,8 +28,8 @@ def logo_pos(i: int) -> tuple[int, int]:
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("VIDEO_FRAME_MCP_WORKSPACE", str(tmp_path / "ws"))
-    from video_frame_mcp import media, operations, workspace
+    monkeypatch.setenv("FLOWEDITS_WORKSPACE", str(tmp_path / "ws"))
+    from flowedits import media, operations, workspace
 
     importlib.reload(workspace)
     importlib.reload(operations)
@@ -115,7 +115,7 @@ def test_remove_regions_and_reset(env):
 
 def test_perspective_target_with_features(env):
     ops, _, logo_path, rep_path, tmp_path = env
-    from video_frame_mcp import media
+    from flowedits import media
 
     # A larger, textured target viewed under changing perspective.
     rng = np.random.default_rng(0)

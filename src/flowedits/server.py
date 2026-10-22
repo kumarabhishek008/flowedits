@@ -39,7 +39,7 @@ settings is safe; reset_frames reverts. Frame indices accept ints, lists or stri
 Workspace: {WORKSPACE}
 """
 
-mcp = MCPServer("video-frame-editor", instructions=INSTRUCTIONS)
+mcp = MCPServer("flowedits", instructions=INSTRUCTIONS)
 
 FrameSelection = Annotated[
     list[int] | str | None,

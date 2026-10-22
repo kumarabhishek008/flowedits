@@ -1,4 +1,4 @@
-# video-frame-mcp
+# flowedits
 
 An MCP server for editing videos frame by frame. The AI agent handles the creative part: it
 looks at frames and makes one replacement image or edits a few crops. The server handles
@@ -67,10 +67,10 @@ uv sync
 ```json
 {
   "mcpServers": {
-    "video-frame-editor": {
+    "flowedits": {
       "command": "uv",
-      "args": ["--directory", "/Users/abhishek/stiddle/video-frame-mcp", "run", "video-frame-mcp"],
-      "env": { "VIDEO_FRAME_MCP_WORKSPACE": "/Users/abhishek/video-frame-projects" }
+      "args": ["--directory", "/Users/abhishek/stiddle/flowedits", "run", "flowedits"],
+      "env": { "FLOWEDITS_WORKSPACE": "/Users/abhishek/flowedits-projects" }
     }
   }
 }
@@ -79,14 +79,14 @@ uv sync
 Or with the Claude Code CLI:
 
 ```bash
-claude mcp add video-frame-editor -- uv --directory /Users/abhishek/stiddle/video-frame-mcp run video-frame-mcp
+claude mcp add flowedits -- uv --directory /Users/abhishek/stiddle/flowedits run flowedits
 ```
 
 ## Configuration
 
 | Env var | Default | |
 |---|---|---|
-| `VIDEO_FRAME_MCP_WORKSPACE` | `~/.video-frame-mcp/projects` | Where frames, edits and outputs are stored |
+| `FLOWEDITS_WORKSPACE` | `~/.flowedits/projects` | Where frames, edits and outputs are stored |
 | `FFMPEG_BINARY` | ffmpeg on `PATH`, otherwise the bundled build | ffmpeg to use |
 
 ## Tips
